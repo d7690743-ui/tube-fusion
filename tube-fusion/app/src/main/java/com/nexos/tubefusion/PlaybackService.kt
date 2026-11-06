@@ -1,0 +1,511 @@
+package com.nexos.tubefusion
+
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
+import android.media.MediaMetadata
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
+import android.os.Build
+import android.os.Handler
+import android.os.IBinder
+import android.os.Looper
+import android.os.PowerManager
+import android.view.KeyEvent
+import android.widget.RemoteViews
+import org.json.JSONObject
+
+/**
+ * Segundo plano forzado: foreground inmediato con tipo mediaPlayback,
+ * STICKY (el sistema lo recrea si lo mata), wake lock parcial para que
+ * la CPU no se duerma con pantalla apagada, y control play/pausa directo
+ * sobre el WebView (vivo o aparcado). Sin AndroidX.
+ */
+class PlaybackService : Service() {
+
+    private var session: MediaSession? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+    private var playing = true
+    private var trackTitle = ""
+    private var audioManager: AudioManager? = null
+    private var focusRequest: AudioFocusRequest? = null
+    private var focusHeld = false
+    private var pausedByFocus = false
+    private var ducked = false
+
+    private val focusListener = AudioManager.OnAudioFocusChangeListener { change ->
+        when (change) {
+            AudioManager.AUDIOFOCUS_GAIN -> onFocusGain()
+            AudioManager.AUDIOFOCUS_LOSS -> onFocusLoss()
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> onFocusLoss()
+            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> onFocusDuck()
+        }
+    }
+    private val channelId = "tubefusion_playback"
+    private val mainHandler = Handler(Looper.getMainLooper())
+
+    private val stateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            // Confirmación del reproductor (fuente de verdad): adopta y limpia pendiente.
+            val reported = intent.getBooleanExtra("playing", playing)
+            if (pending == Command.TOGGLE) pending = null
+            else if (pending == Command.PLAY && reported) pending = null
+            else if (pending == Command.PAUSE && !reported) pending = null
+            playing = reported
+            val title = intent.getStringExtra("title")
+            if (!title.isNullOrEmpty()) {
+                if ((pending == Command.NEXT || pending == Command.PREV) && title != trackTitle) pending = null
+                trackTitle = title
+                try {
+                    getSharedPreferences("tubefusion", MODE_PRIVATE).edit().putString("last_title", title).apply()
+                } catch (_: Exception) {
+                }
+            }
+            session?.updateState()
+            session?.updateMeta()
+            refreshNotification()
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createChannel()
+        val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "TubeFusion:audio").apply {
+            try {
+                acquire()
+            } catch (_: Exception) {
+            }
+        }
+        session = MediaSession(this, "TubeFusion").apply {
+            setCallback(object : MediaSession.Callback() {
+                override fun onPlay() {
+                    sendPlay()
+                }
+
+                override fun onPause() {
+                    sendPause()
+                }
+
+                override fun onSkipToNext() {
+                    dispatch(Command.NEXT)
+                }
+
+                override fun onSkipToPrevious() {
+                    dispatch(Command.PREV)
+                }
+
+                override fun onMediaButtonEvent(mediaButtonIntent: Intent): Boolean {
+                    val event = try {
+                        @Suppress("DEPRECATION")
+                        mediaButtonIntent.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                    } catch (_: Exception) {
+                        null
+                    } ?: return super.onMediaButtonEvent(mediaButtonIntent)
+                    if (event.action != KeyEvent.ACTION_DOWN) return true
+                    when (event.keyCode) {
+                        KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE -> dispatch(Command.TOGGLE)
+                        KeyEvent.KEYCODE_MEDIA_PLAY -> dispatch(Command.PLAY)
+                        KeyEvent.KEYCODE_MEDIA_PAUSE -> dispatch(Command.PAUSE)
+                        KeyEvent.KEYCODE_MEDIA_NEXT -> dispatch(Command.NEXT)
+                        KeyEvent.KEYCODE_MEDIA_PREVIOUS -> dispatch(Command.PREV)
+                        else -> return super.onMediaButtonEvent(mediaButtonIntent)
+                    }
+                    return true
+                }
+            })
+            isActive = true
+            updateState()
+            updateMeta()
+        }
+        val filter = IntentFilter(ACTION_STATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(stateReceiver, filter, RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("DEPRECATION")
+            registerReceiver(stateReceiver, filter)
+        }
+        requestFocus()
+        (application as TubeApp).serviceAlive = true
+        startFg()
+        mainHandler.postDelayed(watchdog, 2000)
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_STOP -> {
+                abandonFocus()
+                try {
+                    val app = application as TubeApp
+                    val parked = app.parkedWebView
+                    if (parked != null) {
+                        if (app.activeWebView === parked) app.activeWebView = null
+                        parked.destroy()
+                        app.parkedWebView = null
+                    }
+                } catch (_: Exception) {
+                }
+                releaseWakeLock()
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return START_NOT_STICKY
+            }
+            ACTION_PLAY -> {
+                pausedByFocus = false
+                sendPlay()
+                return START_STICKY
+            }
+            ACTION_PAUSE -> {
+                pausedByFocus = false
+                sendPause()
+                return START_STICKY
+            }
+            ACTION_TOGGLE -> {
+                pausedByFocus = false // el usuario toma el control: GAIN futuro no reanuda
+                sendToggle()
+                return START_STICKY
+            }
+            ACTION_NEXT -> {
+                dispatch(Command.NEXT)
+                return START_STICKY
+            }
+            ACTION_PREV -> {
+                dispatch(Command.PREV)
+                return START_STICKY
+            }
+            else -> {
+                startFg()
+                return START_STICKY
+            }
+        }
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
+
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        // Barrido de recientes: NO detener; re-afirmar foreground y notificación.
+        try {
+            startFg()
+            refreshNotification()
+        } catch (e: Exception) {
+            (application as TubeApp).addDiag("lifecycle", "onTaskRemoved ex=${e.message ?: "?"}")
+        }
+        super.onTaskRemoved(rootIntent)
+    }
+
+    override fun onDestroy() {
+        (application as TubeApp).serviceAlive = false
+        abandonFocus()
+        try {
+            mainHandler.removeCallbacks(watchdog)
+        } catch (_: Exception) {
+        }
+        try {
+            unregisterReceiver(stateReceiver)
+        } catch (_: Exception) {
+        }
+        releaseWakeLock()
+        session?.release()
+        session = null
+        super.onDestroy()
+    }
+
+    private fun startFg() {
+        if (Build.VERSION.SDK_INT >= 29) {
+            startForeground(NOTIFY_ID, buildNotification(), ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
+        } else {
+            startForeground(NOTIFY_ID, buildNotification())
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try {
+            val lock = wakeLock
+            if (lock != null && lock.isHeld) lock.release()
+        } catch (_: Exception) {
+        }
+        wakeLock = null
+    }
+
+    private fun MediaSession.updateState() {
+        val state = if (playing) PlaybackState.STATE_PLAYING else PlaybackState.STATE_PAUSED
+        setPlaybackState(
+            PlaybackState.Builder()
+                .setActions(
+                    PlaybackState.ACTION_PLAY or PlaybackState.ACTION_PAUSE or PlaybackState.ACTION_PLAY_PAUSE or
+                        PlaybackState.ACTION_SKIP_TO_NEXT or PlaybackState.ACTION_SKIP_TO_PREVIOUS
+                )
+                .setState(state, 0L, 1.0f)
+                .build()
+        )
+    }
+
+    private fun MediaSession.updateMeta() {
+        setMetadata(
+            MediaMetadata.Builder()
+                .putString(MediaMetadata.METADATA_KEY_TITLE, trackTitle.ifEmpty { "TubeFusion" })
+                .putString(MediaMetadata.METADATA_KEY_ARTIST, "YouTube")
+                .build()
+        )
+    }
+
+    /** Comandos multimedia: un solo embudo para sesión, notificación y foco. */
+    private enum class Command { PLAY, PAUSE, TOGGLE, NEXT, PREV }
+
+    private var pending: Command? = null
+    private var pendingAt = 0L
+    private var pendingRetried = false
+
+    private fun sendPlay() = dispatch(Command.PLAY)
+
+    private fun sendPause() = dispatch(Command.PAUSE)
+
+    private fun sendToggle() = dispatch(Command.TOGGLE)
+
+    private fun dispatch(cmd: Command) {
+        val now = System.currentTimeMillis()
+        // Mismo comando pendiente reciente: no reenviar (anti-duplicados).
+        if (pending == cmd && now - pendingAt < 2000) return
+        pending = cmd
+        pendingAt = now
+        pendingRetried = false
+        sendCommandJs(cmd)
+        mainHandler.postDelayed({ checkPending(cmd) }, 3000)
+    }
+
+    private fun sendCommandJs(cmd: Command) {
+        val call = when (cmd) {
+            Command.PLAY -> "TubePlayback.play()"
+            Command.PAUSE -> "TubePlayback.pause()"
+            Command.TOGGLE -> "TubePlayback.toggle()"
+            Command.NEXT -> "TubePlayback.next()"
+            Command.PREV -> "TubePlayback.prev()"
+        }
+        JsRun.run(
+            application as TubeApp, "cmd-" + cmd.name.lowercase(),
+            "(function(){try{if(!window.TubePlayback){if(window.TubeBridge)TubeBridge.onError('cmd','no-bridge');return;}$call;}" +
+                "catch(e){try{if(window.TubeBridge)TubeBridge.onError('cmd',String((e&&e.message)||e));}catch(_){}}})();"
+        )
+    }
+
+    /** Sin confirmación en 3 s: pregunta el estado real y concilia (un reintento). */
+    private fun checkPending(cmd: Command) {
+        if (pending != cmd) return
+        val app = application as TubeApp
+        JsRun.run(
+            app, "reconcile",
+            "(function(){try{if(!window.TubePlayback)return 'no-bridge';return window.TubePlayback.getState();}catch(e){return 'ex';}})();",
+            { raw ->
+            if (pending != cmd) return@run
+            val adopted = parsePlaying(raw)
+            if (adopted == null) {
+                pending = null
+                return@run
+            }
+            val want = when (cmd) {
+                Command.PLAY -> true
+                Command.PAUSE -> false
+                else -> null // TOGGLE/NEXT/PREV: adoptar realidad, no reenviar
+            }
+            if (want != null && adopted != want && !pendingRetried) {
+                pendingRetried = true
+                pendingAt = System.currentTimeMillis()
+                sendCommandJs(cmd)
+                mainHandler.postDelayed({ checkPending(cmd) }, 3000)
+            } else {
+                pending = null
+                if (adopted != playing) {
+                    playing = adopted
+                    session?.updateState()
+                    refreshNotification()
+                }
+            }
+            },
+            true
+        )
+    }
+
+    private fun parsePlaying(raw: String?): Boolean? {
+        if (raw.isNullOrEmpty() || raw == "null") return null
+        return try {
+            var t = raw.trim()
+            if (t.length >= 2 && t.startsWith("\"") && t.endsWith("\"")) {
+                t = t.substring(1, t.length - 1).replace("\\\"", "\"").replace("\\\\", "\\")
+            }
+            val o = JSONObject(t)
+            if (o.has("playing")) o.getBoolean("playing") else null
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /**
+     * Vigilante nativo: cada 2 s reanuda si YouTube pausó solo. Los timers
+     * del servicio no los frena el sistema como los de la página oculta.
+     */
+    private val watchdog = object : Runnable {
+        override fun run() {
+            try {
+                val app = application as TubeApp
+                JsRun.run(
+                    app, "watchdog",
+                    "(function(){try{var v=document.querySelector('video');" +
+                        "if(v&&v.paused&&window.__wasPlaying&&!document.querySelector('.ad-showing,.ytp-ad-playing')){v.play();}" +
+                        "}catch(e){try{if(window.TubeBridge)TubeBridge.onError('watchdog',String((e&&e.message)||e));}catch(_){}}})();"
+                )
+            } catch (e: Exception) {
+                (application as TubeApp).addDiag("watchdog", "ex=${e.message ?: "?"}")
+            }
+            mainHandler.postDelayed(this, 2000)
+        }
+    }
+
+    // ---------- Audio Focus ----------
+
+    /** Pide foco una sola vez; si ya está pedido no repite. */
+    private fun requestFocus() {
+        if (focusHeld) return
+        val am = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager = am
+        val granted = if (Build.VERSION.SDK_INT >= 26) {
+            val req = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setOnAudioFocusChangeListener(focusListener, mainHandler)
+                .build()
+            focusRequest = req
+            am.requestAudioFocus(req) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        } else {
+            @Suppress("DEPRECATION")
+            am.requestAudioFocus(focusListener, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN) ==
+                AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        }
+        focusHeld = granted
+    }
+
+    private fun abandonFocus() {
+        if (!focusHeld) return
+        focusHeld = false
+        pausedByFocus = false
+        try {
+            if (Build.VERSION.SDK_INT >= 26) {
+                focusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
+            } else {
+                @Suppress("DEPRECATION")
+                audioManager?.abandonAudioFocus(focusListener)
+            }
+        } catch (_: Exception) {
+        }
+        focusRequest = null
+    }
+
+    private fun onFocusGain() {
+        if (ducked) {
+            ducked = false
+            evalVolume(1.0f)
+        }
+        // Solo reanuda si pausamos NOSOTROS por pérdida de foco.
+        if (pausedByFocus) {
+            pausedByFocus = false
+            sendPlay() // confirmación vía puente; sin volteos optimistas
+        }
+    }
+
+    private fun onFocusLoss() {
+        // Si el usuario ya había pausado, no tocamos nada.
+        if (!playing) return
+        pausedByFocus = true
+        sendPause() // confirmación vía puente; sin volteos optimistas
+    }
+
+    private fun onFocusDuck() {
+        if (!playing || ducked) return
+        ducked = true
+        evalVolume(0.2f)
+    }
+
+    private fun evalVolume(v: Float) {
+        evalJs("(function(){try{var el=document.querySelector('video');if(el){el.volume=$v;}}}catch(e){}})();")
+    }
+
+    private fun evalJs(js: String) {
+        JsRun.run(application as TubeApp, "svc-js", js)
+    }
+
+    private fun refreshNotification() {
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        nm.notify(NOTIFY_ID, buildNotification())
+    }
+
+    private fun actionIntent(action: String): PendingIntent {
+        val intent = Intent(this, PlaybackService::class.java).setAction(action)
+        return PendingIntent.getService(this, action.hashCode(), intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
+    }
+
+    /**
+     * Notificación con layout propio (sin plantilla MediaStyle del sistema).
+     * MediaSession se conserva aparte: lockscreen y Bluetooth la necesitan
+     * por diseño de Android, pero la notificación visible es 100% nuestra.
+     */
+    private fun buildNotification(): Notification {
+        val builder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Notification.Builder(this, channelId)
+        } else {
+            @Suppress("DEPRECATION")
+            Notification.Builder(this)
+        }
+        val openApp = PendingIntent.getActivity(
+            this, 0,
+            Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+        val views = RemoteViews(packageName, R.layout.notification_player)
+        views.setTextViewText(R.id.notif_title, trackTitle.ifEmpty { "TubeFusion en segundo plano" })
+        views.setTextViewText(R.id.notif_status, if (playing) "Reproduciendo" else "Pausado")
+        // Acciones discretas con ID propio: mismo administrador que MediaSession.
+        views.setOnClickPendingIntent(R.id.notif_play, actionIntent(ACTION_PLAY))
+        views.setOnClickPendingIntent(R.id.notif_pause, actionIntent(ACTION_PAUSE))
+        views.setOnClickPendingIntent(R.id.notif_next, actionIntent(ACTION_NEXT))
+        views.setOnClickPendingIntent(R.id.notif_prev, actionIntent(ACTION_PREV))
+        views.setOnClickPendingIntent(R.id.notif_stop, actionIntent(ACTION_STOP))
+        builder.setSmallIcon(android.R.drawable.ic_media_play)
+            .setContentIntent(openApp)
+            .setOngoing(true)
+            .setCategory(Notification.CATEGORY_TRANSPORT)
+            .setCustomContentView(views)
+            .setStyle(Notification.DecoratedCustomViewStyle())
+        return builder.build()
+    }
+
+    private fun createChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            nm.createNotificationChannel(NotificationChannel(channelId, "Reproducción", NotificationManager.IMPORTANCE_LOW))
+        }
+    }
+
+    companion object {
+        const val ACTION_PLAY = "com.nexos.tubefusion.PLAY"
+        const val ACTION_PAUSE = "com.nexos.tubefusion.PAUSE"
+        const val ACTION_TOGGLE = "com.nexos.tubefusion.TOGGLE"
+        const val ACTION_NEXT = "com.nexos.tubefusion.NEXT"
+        const val ACTION_PREV = "com.nexos.tubefusion.PREV"
+        const val ACTION_STOP = "com.nexos.tubefusion.STOP"
+        const val ACTION_STATE = "com.nexos.tubefusion.STATE"
+        const val NOTIFY_ID = 3001
+    }
+}

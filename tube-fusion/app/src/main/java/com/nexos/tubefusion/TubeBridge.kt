@@ -1,0 +1,79 @@
+package com.nexos.tubefusion
+
+import android.content.Intent
+import android.os.Handler
+import android.os.Looper
+import android.webkit.JavascriptInterface
+import android.webkit.WebView
+
+/**
+ * Puente JS → nativo: la página reporta play/pausa y título del video.
+ * Atado a la aplicación (no a la actividad) para seguir vivo con el
+ * WebView aparcado. Seguro en minSdk 24: requiere @JavascriptInterface.
+ */
+class TubeBridge(private val app: TubeApp) {
+
+    @JavascriptInterface
+    fun onState(playing: Boolean, title: String) {
+        val clean = title.take(80)
+        val changed = app.lastPlaying != playing || app.lastTitle != clean
+        app.lastPlaying = playing
+        app.lastTitle = clean
+        if (changed) {
+            app.sendBroadcast(
+                Intent(PlaybackService.ACTION_STATE)
+                    .setPackage(app.packageName)
+                    .putExtra("playing", playing)
+                    .putExtra("title", clean)
+            )
+        }
+    }
+
+    @JavascriptInterface
+    fun onError(tag: String, message: String) {
+        app.addDiag("js-$tag", message)
+    }
+
+    private var lastPersistAt = 0L
+
+    @JavascriptInterface
+    fun onProgress(posSec: Double, durSec: Double) {
+        if (posSec.isNaN() || durSec.isNaN()) return
+        val now = System.currentTimeMillis()
+        if (now - lastPersistAt < 15_000) return
+        lastPersistAt = now
+        app.saveProgress(posSec.toLong(), durSec.toLong())
+    }
+}
+
+/**
+ * Ejecutor JS central: hilo UI, detecta WebView ausente (una vez) y
+ * registra resultados inesperados de evaluateJavascript.
+ */
+object JsRun {
+    fun run(app: TubeApp, tag: String, js: String, onResult: ((String?) -> Unit)? = null, expectResult: Boolean = false) {
+        val wv: WebView? = app.activeWebView
+        if (wv == null) {
+            if (!app.wwNullLogged) {
+                app.wwNullLogged = true
+                app.addDiag(tag, "webview-null")
+            }
+            onResult?.invoke(null)
+            return
+        }
+        app.wwNullLogged = false
+        Handler(Looper.getMainLooper()).post {
+            try {
+                wv.evaluateJavascript(js) { result ->
+                    if (!expectResult && !result.isNullOrEmpty() && result != "null") {
+                        app.addDiag(tag, "result=$result")
+                    }
+                    onResult?.invoke(result)
+                }
+            } catch (e: Exception) {
+                app.addDiag(tag, "ex=${e.message ?: "?"}")
+                onResult?.invoke(null)
+            }
+        }
+    }
+}
