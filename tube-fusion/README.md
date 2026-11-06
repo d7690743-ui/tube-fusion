@@ -1,0 +1,101 @@
+# TubeFusion — YouTube sin anuncios (WebView)
+
+App Android mínima (`com.nexos.tubefusion`) que abre YouTube móvil en un
+WebView con triple filtro:
+
+1. **Bloqueo de hosts** (`shouldInterceptRequest`): los dominios de
+   publicidad y rastreo (`doubleclick.net`, `googlesyndication.com`,
+   `google-analytics.com`, `adservice.google.com`, `ads.youtube.com`)
+   se responden vacíos. Esto quita banners y rastreo.
+2. **Auto-skip con JS**: cada 0.5 s pulsa el botón "Omitir anuncio" si
+   aparece, y si hay anuncio de video lo pone mudo a 16x para que pase
+   rápido. Los anuncios de video salen de los mismos hosts que el video,
+   por eso no se pueden bloquear por host y se aceleran.
+3. **CSS**: oculta contenedores de anuncios y banners.
+
+Además: pantalla completa para video, botón atrás navega el historial,
+sin dependencias externas.
+
+## Segundo plano, PiP y controles
+
+- **Fondo ON**: foreground inmediato tipo `mediaPlayback`, STICKY y
+  wake lock parcial: el audio sigue con la app cerrada, el móvil
+  bloqueado o la app barrida de recientes. El WebView se aparca en la
+  aplicación al morir la actividad (atrás minimiza en vez de cerrar) y
+  al reabrir sigue donde iba; si el proceso muere, se restaura la
+  última URL.
+- **Anti-pausa**: YouTube pausa al ocultar la página; la app le reporta
+  siempre visible, reanuda pausas no pedidas y un vigilante nativo cada
+  2 s hace lo mismo aunque la página esté dormida. La pausa que TÚ
+  pides (tap o notificación) sí se respeta.
+- Si tu marca (Xiaomi/Oppo/Vivo/Huawei) igual lo corta: Ajustes >
+  Batería > TubeFusion > Sin restricciones.
+
+## V2: foco de audio, diagnóstico y recuperación
+
+- **Audio Focus**: llamadas y otras apps pausan (transitorio) o bajan
+  volumen (duck); al volver el foco reanuda solo si la app pausó (nunca
+  si pausaste tú).
+- **Diag**: botón que muestra errores JS/nativos con hora (sin URLs ni
+  títulos). Todo `evaluateJavascript` crítico registra resultado.
+- **Ciclo**: `onPause`/`onResume` pausan solo con Fondo OFF (nunca en
+  PiP); `onTaskRemoved` no detiene; sin referencias obsoletas.
+- **Renderer**: `onRenderProcessGone` reconstruye el WebView con última
+  URL+título+posición (mejor esfuerzo, respeta tu pausa).
+- **Notificación multimedia**: play/pausa desde la barra, la pantalla
+  de bloqueo y botones Bluetooth, con el título real del video.
+- **Puente JS ↔ Java**: la página reporta play/pausa y título
+  (`TubeBridge`), y nativo controla el video. Sincroniza notificación,
+  lockscreen y MediaSession incluso con la actividad muerta.
+
+## V2 media: órdenes PLAY / PAUSE / TOGGLE
+
+- Administrador único de órdenes (`dispatch`): sesión, notificación,
+  foco de audio y botones usan el mismo embudo.
+- `PLAY`/`PAUSE` idempotentes + `TOGGLE`; la API JS `TubePlayback`
+  (`play/pause/toggle/next/prev/getState`) comprueba el estado real y
+  reporta si no hay video.
+- El servicio NO voltea estado al pulsar: espera confirmación del
+  reproductor (puente), con anti-duplicados y reconciliación a los 3 s
+  (un reintento). Sin bucles ni notificaciones infinitas.
+- Notificación propia con 5 acciones discretas: anterior, reproducir,
+  pausar, siguiente, detener (+ tap abre la app).
+- **PiP**: botón flotante o automático al salir con video en pantalla
+  completa (requiere Android 8+).
+
+## Blocklist actualizable
+
+La lista de bloqueo vive en `blocklist.json` (raíz del repo): la app
+la descarga al iniciar y guarda caché. Si YouTube cambia algo, basta
+editar ese JSON y subirlo: sin compilar APK nuevo.
+
+## Limitaciones honestas
+
+- YouTube cambia su web seguido y combate bloqueadores: algún selector
+  puede dejar de funcionar y verse un aviso anti-adblock. Avisar y se
+  ajusta.
+- Requiere conexión y WebView del sistema actualizado.
+
+## Compilar y obtener el APK
+
+```bash
+gradle assembleDebug
+# app/build/outputs/apk/debug/app-debug.apk
+# (o ./gradlew assembleDebug si agregas gradle-wrapper.jar)
+```
+
+O sube a GitHub: cada push compila solo (**Actions → Build APK
+(debug) → Artifacts → app-debug**).
+
+## Fusión 2.0 (YouTube Blocker + TubeLite)
+
+Fondo ON por defecto, como en el viejo YouTube Blocker: el servicio arranca al abrir la app y si muere se reinicia en vez de apagarse solo. Lo demás sigue igual: triple filtro, `blocklist.json`, PiP, foco de audio y notificación con controles.
+
+## 2.1 Anti-congelado del WebView
+
+El audio seguía pero la imagen se pasmaba: el WebView aparcado pierde la superficie y el renderer se suspende. Ahora al reanexar se reanuda (`onResume` + `resumeTimers` + reinyectar JS), la pantalla completa usa INVISIBLE en vez de GONE, no se fuerza `play()` mientras el video sigue cargando (`readyState`), y el vigilante descongela solo si el progreso se para 60 s con audio sonando.
+
+## Versiones fijadas
+
+- Java 17 (Temurin), Gradle 8.9, AGP 8.7.3, Kotlin 1.9.24
+- `compileSdk`/`targetSdk` 35, `minSdk` 24 (Android 7.0+, ARM64)
