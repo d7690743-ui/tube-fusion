@@ -352,6 +352,8 @@ class PlaybackService : Service() {
     /**
      * Vigilante nativo: cada 2 s reanuda si YouTube pausó solo. Los timers
      * del servicio no los frena el sistema como los de la página oculta.
+     * Además detecta el WebView pasmado (audio sigue, progreso parado)
+     * y lo descongela reanudando timers y tocando el video.
      */
     private val watchdog = object : Runnable {
         override fun run() {
@@ -360,9 +362,28 @@ class PlaybackService : Service() {
                 JsRun.run(
                     app, "watchdog",
                     "(function(){try{var v=document.querySelector('video');" +
-                        "if(v&&v.paused&&window.__wasPlaying&&!document.querySelector('.ad-showing,.ytp-ad-playing')){v.play();}" +
+                        "if(v&&v.paused&&window.__wasPlaying&&v.readyState>=3&&!document.querySelector('.ad-showing,.ytp-ad-playing')){v.play();}" +
                         "}catch(e){try{if(window.TubeBridge)TubeBridge.onError('watchdog',String((e&&e.message)||e));}catch(_){}}})();"
                 )
+                // Anti-congelado: sonando pero sin progreso 60 s = pasmado.
+                if (playing && app.lastProgressAt > 0 &&
+                    System.currentTimeMillis() - app.lastProgressAt > 60_000
+                ) {
+                    app.lastProgressAt = System.currentTimeMillis()
+                    app.addDiag("watchdog", "descongelar")
+                    mainHandler.post {
+                        try {
+                            val wv = app.activeWebView
+                            wv?.onResume()
+                            wv?.resumeTimers()
+                        } catch (_: Exception) {
+                        }
+                    }
+                    JsRun.run(
+                        app, "descongelar",
+                        "(function(){try{var v=document.querySelector('video');if(v&&window.__wasPlaying){v.pause();v.play();}}catch(e){}})();"
+                    )
+                }
             } catch (e: Exception) {
                 (application as TubeApp).addDiag("watchdog", "ex=${e.message ?: "?"}")
             }

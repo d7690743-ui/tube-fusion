@@ -40,6 +40,7 @@ class TubeBridge(private val app: TubeApp) {
     fun onProgress(posSec: Double, durSec: Double) {
         if (posSec.isNaN() || durSec.isNaN()) return
         val now = System.currentTimeMillis()
+        app.lastProgressAt = now
         if (now - lastPersistAt < 15_000) return
         lastPersistAt = now
         app.saveProgress(posSec.toLong(), durSec.toLong())

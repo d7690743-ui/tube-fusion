@@ -91,6 +91,10 @@ O sube a GitHub: cada push compila solo (**Actions → Build APK
 
 Fondo ON por defecto, como en el viejo YouTube Blocker: el servicio arranca al abrir la app y si muere se reinicia en vez de apagarse solo. Lo demás sigue igual: triple filtro, `blocklist.json`, PiP, foco de audio y notificación con controles.
 
+## 2.1 Anti-congelado del WebView
+
+El audio seguía pero la imagen se pasmaba: el WebView aparcado pierde la superficie y el renderer se suspende. Ahora al reanexar se reanuda (`onResume` + `resumeTimers` + reinyectar JS), la pantalla completa usa INVISIBLE en vez de GONE, no se fuerza `play()` mientras el video sigue cargando (`readyState`), y el vigilante descongela solo si el progreso se para 60 s con audio sonando.
+
 ## Versiones fijadas
 
 - Java 17 (Temurin), Gradle 8.9, AGP 8.7.3, Kotlin 1.9.24

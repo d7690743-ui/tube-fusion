@@ -16,6 +16,9 @@ class TubeApp : Application() {
     /** Último estado reportado por el puente JS (notificación/metadata). */
     @Volatile var lastPlaying = true
 
+    /** Última vez que la página reportó progreso con video sonando. */
+    @Volatile var lastProgressAt = 0L
+
     @Volatile var lastTitle = ""
 
     @Volatile var wwNullLogged = false

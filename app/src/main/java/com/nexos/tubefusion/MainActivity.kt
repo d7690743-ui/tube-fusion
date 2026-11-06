@@ -127,6 +127,16 @@ class MainActivity : Activity() {
             )
             app.activeWebView = webView
             configureWebView()
+            // Anti-congelado: el WebView aparcado pierde la superficie y
+            // el renderer se suspende (el audio sigue, la imagen se pasma).
+            // Al reanexar hay que reanudarlo y reinyectar el JS.
+            try {
+                webView.onResume()
+                webView.resumeTimers()
+            } catch (_: Exception) {
+            }
+            webView.evaluateJavascript(skipJs(), null)
+            webView.evaluateJavascript("(function(){var v=document.querySelector('video');if(v&&window.__wasPlaying&&v.paused&&v.readyState>=3){try{v.play();}catch(e){}}})();", null)
         } else {
             attachFreshWebView()
             if (state == null) loadLastOrHome()
@@ -242,7 +252,9 @@ class MainActivity : Activity() {
                 customCallback = callback
                 fullscreenBox.addView(view)
                 fullscreenBox.visibility = View.VISIBLE
-                webView.visibility = View.GONE
+                // INVISIBLE (no GONE): con GONE el WebView pierde la
+                // superficie y al volver el video se queda pasmado.
+                webView.visibility = View.INVISIBLE
             }
 
             override fun onHideCustomView() {
@@ -560,7 +572,9 @@ class MainActivity : Activity() {
               else if (v && !ad) {
                 try { if (v.playbackRate !== 1) v.playbackRate = 1; } catch (e) {}
                 v.muted = false;
-                if (v.paused && window.__wasPlaying) { try { v.play(); } catch (e) {} }
+                // No forzar play si sigue cargando (readyState<3): eso
+                // atasca el reproductor. Solo reanudar si ya hay datos.
+                if (v.paused && window.__wasPlaying && v.readyState >= 3) { try { v.play(); } catch (e) {} }
               }
             } catch (e) { try { if (window.TubeBridge) TubeBridge.onError('skip', String((e && e.message) || e)); } catch (_) {} }
             report();
