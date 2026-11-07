@@ -532,6 +532,14 @@ class MainActivity : Activity() {
           var SKIP = '${b.skipButtons}';
           var MARK = '${b.adMarkers}';
           var lastRep = '';
+          // SponsorBlock 2.2: salta patrocinios/intro/outro dentro del video.
+          // API gratis y abierta (sponsor.ajay.app), sin llave. No bloquea
+          // anuncios de YouTube, solo segmentos marcados por la comunidad.
+          var sbSegments = [];
+          var sbVideoId = '';
+          function sbGetId(){ var m=(location.href||'').match(/[?&]v=([A-Za-z0-9_-]{11})/); if(m) return m[1]; var m2=(location.pathname||'').match(/\/shorts\/([A-Za-z0-9_-]{11})/); return m2?m2[1]:''; }
+          function sbLoad(){ var id=sbGetId(); if(!id||id===sbVideoId) return; sbVideoId=id; sbSegments=[]; var cats=["sponsor","selfpromo","interaction","intro","outro","preview","music_offtopic","filler"]; fetch("https://sponsor.ajay.app/api/skipSegments?videoID="+id+"&categories="+encodeURIComponent(JSON.stringify(cats))).then(function(r){ if(!r.ok) return null; return r.json(); }).then(function(d){ if(!d) return; sbSegments=d.filter(function(s){ return s.actionType==="skip"; }).map(function(s){ return [s.segment[0], s.segment[1]]; }); }).catch(function(){ sbSegments=[]; }); }
+          function sbCheck(v){ if(!v||!sbSegments.length) return; var t=v.currentTime; for(var i=0;i<sbSegments.length;i++){ var s=sbSegments[i]; if(t>=s[0] && t < s[1]-0.3){ try{ v.currentTime=s[1]; }catch(e){} break; } } }
           if (window.__wasPlaying === undefined) window.__wasPlaying = true;
           try {
             // YouTube pausa al ocultar la página: decirle siempre visible.
@@ -565,6 +573,8 @@ class MainActivity : Activity() {
           function skip() {
             try {
               var v = document.querySelector('video');
+              sbLoad();
+              sbCheck(v);
               var ad = MARK.split(',').some(function(sel){ return document.querySelector(sel); });
               var btn = SKIP.split(',').map(function(sel){ return document.querySelector(sel); }).find(function(x){ return x; });
               if (btn) { btn.click(); }

@@ -95,6 +95,10 @@ Fondo ON por defecto, como en el viejo YouTube Blocker: el servicio arranca al a
 
 El audio seguía pero la imagen se pasmaba: el WebView aparcado pierde la superficie y el renderer se suspende. Ahora al reanexar se reanuda (`onResume` + `resumeTimers` + reinyectar JS), la pantalla completa usa INVISIBLE en vez de GONE, no se fuerza `play()` mientras el video sigue cargando (`readyState`), y el vigilante descongela solo si el progreso se para 60 s con audio sonando.
 
+## 2.2 SponsorBlock
+
+Salta los segmentos dentro del video marcados por la comunidad (patrocinio, autopromo, intro, outro, recordatorio de suscribirse, preview, filler y música fuera de tema) con la API pública y gratuita de SponsorBlock (`sponsor.ajay.app/api/skipSegments`, sin llave). No bloquea los anuncios de YouTube, solo esos segmentos del creador. Se pide al cambiar de video y se revisa en el mismo loop de 0.5 s del auto-skip; si el video no tiene segmentos, la API devuelve 404 y no pasa nada.
+
 ## Versiones fijadas
 
 - Java 17 (Temurin), Gradle 8.9, AGP 8.7.3, Kotlin 1.9.24
